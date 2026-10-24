@@ -10,10 +10,19 @@ Data:  OpenStreetMap (downloaded once per city/radius, then cached)
 
 import io
 import math
+import time
 
 import matplotlib
 matplotlib.use("Agg")                      # render off-screen (no GUI window)
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
+
+# Fallback fonts for non-Latin street names (e.g. Amharic). Matplotlib uses the
+# first font that has each character. Only fonts actually installed are used.
+_installed = {f.name for f in font_manager.fontManager.ttflist}
+plt.rcParams["font.family"] = ["DejaVu Sans"] + [
+    f for f in ["Noto Sans Ethiopic", "Abyssinica SIL", "Noto Sans Arabic", "Noto Sans CJK JP"]
+    if f in _installed]
 import geopandas as gpd
 import osmnx as ox
 import folium
@@ -90,8 +99,47 @@ def first(v):
     return v[0] if isinstance(v, list) else v
 
 
-@st.cache_data(show_spinner=False)
-def fetch_roads(lat, lon, dist, network):
+# Overpass = the free OpenStreetMap query server osmnx downloads from.
+# The main one sometimes refuses connections when overloaded, so we fall back
+# to public mirrors (same OSM data, different host).
+OVERPASS_MIRRORS = [
+    "https://overpass-api.de/api",
+    "https://overpass.private.coffee/api",
+    "https://maps.mail.ru/osm/tools/overpass/api",
+]
+# "No features of this type here" is a normal result, not a server failure
+NO_DATA_ERRORS = tuple(e for e in [
+    getattr(getattr(ox, "_errors", None), "InsufficientResponseError", None)] if e)
+
+
+# Print every download request/response to the terminal running streamlit.
+ox.settings.log_console = True
+ox.settings.requests_timeout = 180       # big street queries can take 1-3 min
+ox.settings.overpass_rate_limit = False  # don't pause 60s when a server is down
+
+
+def use_server(url):
+    # osmnx 2.x calls it overpass_url, 1.x overpass_endpoint - set both
+    ox.settings.overpass_url = url
+    ox.settings.overpass_endpoint = url
+
+
+def with_mirrors(fn, *args):
+    """Try each Overpass server in turn; raise only if all of them fail."""
+    errors = []
+    for url in OVERPASS_MIRRORS:
+        use_server(url)
+        print(f"[map-app] trying {url}", flush=True)
+        try:
+            return fn(*args)
+        except NO_DATA_ERRORS:
+            raise
+        except Exception as e:              # refused / timeout / 429 / 504
+            errors.append(f"{url.split('/')[2]}: {type(e).__name__}")
+    raise ConnectionError("All OpenStreetMap servers failed -> " + "; ".join(errors))
+
+
+def _download_roads(lat, lon, dist, network):
     G = ox.graph_from_point((lat, lon), dist=dist, network_type=network,
                             retain_all=True, simplify=True)
     e = ox.graph_to_gdfs(G, nodes=False).reindex(columns=["highway", "name", "geometry"])
@@ -101,15 +149,26 @@ def fetch_roads(lat, lon, dist, network):
     return e[["rtype", "name", "geometry"]].to_crs(utm_crs(lat, lon))
 
 
-@st.cache_data(show_spinner=False)
-def fetch_layer(lat, lon, dist, layer):
-    try:
-        g = ox.features_from_point((lat, lon), tags=LAYER_TAGS[layer], dist=dist)
-    except Exception:                       # nothing of this type in the area
-        return gpd.GeoDataFrame(geometry=[], crs=utm_crs(lat, lon))
+def _download_layer(lat, lon, dist, layer):
+    g = ox.features_from_point((lat, lon), tags=LAYER_TAGS[layer], dist=dist)
     keep = ["LineString", "MultiLineString"] if layer == "rail" else ["Polygon", "MultiPolygon"]
     g = g[g.geom_type.isin(keep)]
     return gpd.GeoDataFrame(geometry=g.geometry.values, crs=g.crs).to_crs(utm_crs(lat, lon))
+
+
+# Failures are never cached (Streamlit only caches successful returns),
+# so clicking Generate again retries for real.
+@st.cache_data(show_spinner=False)
+def fetch_roads(lat, lon, dist, network):
+    return with_mirrors(_download_roads, lat, lon, dist, network)
+
+
+@st.cache_data(show_spinner=False)
+def fetch_layer(lat, lon, dist, layer):
+    try:
+        return with_mirrors(_download_layer, lat, lon, dist, layer)
+    except NO_DATA_ERRORS:                  # e.g. no railways in this area
+        return gpd.GeoDataFrame(geometry=[], crs=utm_crs(lat, lon))
 
 # =============================== RENDER =====================================
 
@@ -120,7 +179,8 @@ def to_dms(deg, pos, neg):
     return f"{d}°{m:02d}'{s:04.1f}\"{h}"
 
 
-def render(o):
+def render(o, step=lambda label: None):
+    """step(label) is called as each stage starts, so the UI can show progress."""
     lat, lon, r = o["lat"], o["lon"], o["radius"]
     crs = utm_crs(lat, lon)
     c = gpd.GeoSeries([Point(lon, lat)], crs=4326).to_crs(crs).iloc[0]
@@ -147,17 +207,21 @@ def render(o):
     # Layers bottom -> top
     for layer, z in [("water", 1), ("parks", 1), ("buildings", 2)]:
         if o["layers"][layer]:
+            step(f"Downloading {layer}")
             g = fetch_layer(lat, lon, dist, layer)
             if len(g):
                 gpd.clip(g, clip).plot(ax=ax, color=col[layer], linewidth=0, zorder=z)
 
     if o["layers"]["rail"]:
+        step("Downloading railways")
         g = fetch_layer(lat, lon, dist, "rail")
         if len(g):
             gpd.clip(g, clip).plot(ax=ax, color=col["rail"], linewidth=0.6,
                                    linestyle=(0, (4, 2)), zorder=3)
 
+    step("Downloading streets (slowest step on first run)")
     roads = gpd.clip(fetch_roads(lat, lon, dist, o["network"]), clip)
+    step(f"Drawing {len(roads):,} road segments")
     roads["w"] = roads["rtype"].map(ROAD_WIDTHS).fillna(0.4) * o["road_scale"]
     roads["major"] = roads["rtype"].isin(MAJOR_ROADS)
 
@@ -175,6 +239,7 @@ def render(o):
 
     # Street names (major roads first, each name not repeated within 1.5 km)
     if o["labels"]:
+        step("Placing street names")
         placed = {}
         named = roads[roads["name"].notna() & (roads.geometry.length > 250)]
         for nm, geom in zip(named.sort_values("w", ascending=False)["name"],
@@ -262,7 +327,7 @@ with sb.expander("Fine-tune colors"):
     colors = {k: st.color_picker(k.replace("_", " ").capitalize(), v, key=f"{preset}_{k}")
               for k, v in PRESETS[preset].items()}
 
-generate = sb.button("Generate poster", type="primary", use_container_width=True)
+generate = sb.button("Generate poster", type="primary", width="stretch")
 
 # ---------------- 1. Interactive area picker ----------------
 st.subheader("1. Pick the area")
@@ -303,19 +368,47 @@ if generate:
     opts = dict(lat=lat, lon=lon, radius=radius, shape=shape, size=size,
                 title=title, subtitle=subtitle, network=network, layers=layers,
                 labels=labels, label_size=label_size, road_scale=road_scale, colors=colors)
-    with st.spinner("Downloading OpenStreetMap data (first time per area) and drawing..."):
+
+    # Live status box: each stage shows a spinner line, then turns into a
+    # checkmark with how long it took. Elapsed total is shown in the header.
+    t_start = time.time()
+    with st.status("Building your poster...", expanded=True) as status:
+        current = {}                         # the stage that is running now
+
+        def step(label):
+            finish_current()
+            current.update(label=label, t=time.time(), slot=st.empty())
+            current["slot"].markdown(f"⏳ {label}...")
+            status.update(label=f"{label}... ({time.time() - t_start:.0f}s elapsed)")
+
+        def finish_current():
+            if current:
+                secs = time.time() - current["t"]
+                note = "  (cached)" if secs < 1 and "Downloading" in current["label"] else ""
+                current["slot"].markdown(f"✅ {current['label']} — {secs:.1f}s{note}")
+
         try:
-            fig = render(opts)
+            fig = render(opts, step)
+            step("Exporting PDF and preview")
             ss["png"] = fig_bytes(fig, "png", dpi=80)
             ss["pdf"] = fig_bytes(fig, "pdf")
             ss["name"] = title.lower().replace(" ", "_") or "map"
             plt.close(fig)
+            finish_current()
+            status.update(label=f"Poster ready in {time.time() - t_start:.0f}s",
+                          state="complete", expanded=False)
         except Exception as e:
+            if current:
+                current["slot"].markdown(f"❌ {current['label']} — failed")
+            status.update(label="Something went wrong", state="error", expanded=True)
             st.error(f"Couldn't build the map: {e}")
+            if "servers failed" in str(e):
+                st.info("OpenStreetMap's free servers are busy or unreachable. "
+                        "Wait a minute and click Generate again.")
 
 if "png" in ss:
     left, right = st.columns([3, 1])
-    left.image(ss["png"], use_container_width=True)
+    left.image(ss["png"], width="stretch")
     right.download_button("Download PDF (print-ready)", ss["pdf"],
                           file_name=f"{ss['name']}_poster.pdf",
                           mime="application/pdf", type="primary")
