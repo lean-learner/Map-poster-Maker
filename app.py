@@ -1,7 +1,8 @@
 """
 City Map Poster Maker - Streamlit app
 -------------------------------------
-Pick a city, shape, layers and colors -> preview -> download a print-ready PDF.
+Pick a city, click the map to set the area, choose layers and colors ->
+preview -> download a print-ready PDF.
 
 Run:   streamlit run app.py
 Data:  OpenStreetMap (downloaded once per city/radius, then cached)
@@ -15,7 +16,9 @@ matplotlib.use("Agg")                      # render off-screen (no GUI window)
 import matplotlib.pyplot as plt
 import geopandas as gpd
 import osmnx as ox
+import folium
 import streamlit as st
+from streamlit_folium import st_folium
 from shapely.geometry import Point, box
 
 # =============================== CONFIG ====================================
@@ -33,7 +36,6 @@ CITIES = {                                  # name -> (lat, lon) of map center
     "Dubai, UAE": (25.2048, 55.2708),
     "Addis Ababa, Ethiopia": (9.0300, 38.7400),
     "Bethel & Bisrate Gabriel, Addis": (8.9978, 38.7096),
-    "Custom coordinates...": None,
 }
 
 PRESETS = {
@@ -207,81 +209,117 @@ def fig_bytes(fig, fmt, dpi=None):
     return buf.getvalue()
 
 # ================================= UI =======================================
+# No form: every sidebar change re-runs the script, which is cheap (it only
+# redraws the picker map). The slow poster render runs only on the button.
 
 st.set_page_config(page_title="City Map Poster Maker", layout="wide")
 st.title("City Map Poster Maker")
+ss = st.session_state
+sb = st.sidebar
 
-# These two sit OUTSIDE the form: changing them must re-run the page right away
-# so the title defaults and the color pickers update before you click Generate.
-st.sidebar.subheader("Place")
-city = st.sidebar.selectbox("City", list(CITIES))
-preset = st.sidebar.selectbox("Color preset", list(PRESETS))
+# ---------------- Place ----------------
+sb.subheader("Place")
+city = sb.selectbox("Jump to city", list(CITIES))
+if ss.get("city") != city:                  # new city picked -> recenter on it
+    ss["city"] = city
+    ss["center"] = CITIES[city]
+lat, lon = ss["center"]
+sb.caption(f"Center: {lat:.4f}, {lon:.4f} — click the map to move it")
+radius = sb.slider("Radius (meters)", 500, 10000, 3000, step=250,
+                   help="Bigger = more city, slower first download")
 
-with st.sidebar.form("options"):
-    if CITIES[city] is None:
-        lat = st.number_input("Latitude", value=30.2747, format="%.4f")
-        lon = st.number_input("Longitude", value=-97.7404, format="%.4f")
-    else:
-        lat, lon = CITIES[city]
-    radius = st.slider("Radius (meters)", 1000, 10000, 3500, step=500,
-                       help="Bigger = more city, slower first download")
+# ---------------- Layout ----------------
+sb.subheader("Layout")
+shape = sb.radio("Shape", ["Rectangle", "Circle"], horizontal=True)
+size = SIZES[sb.selectbox("Poster size", list(SIZES))]
+if city in TITLE_OVERRIDES:
+    default_title, default_sub = TITLE_OVERRIDES[city]
+else:
+    default_title, default_sub = city.split(",")[0], city.split(",")[1].strip()
+title = sb.text_input("Title", default_title)
+subtitle = sb.text_input("Subtitle", default_sub)
 
-    st.subheader("Layout")
-    shape = st.radio("Shape", ["Rectangle", "Circle"], horizontal=True)
-    size = SIZES[st.selectbox("Poster size", list(SIZES))]
-    if city in TITLE_OVERRIDES:
-        default_title, default_sub = TITLE_OVERRIDES[city]
-    elif CITIES[city]:
-        default_title, default_sub = city.split(",")[0], city.split(",")[1].strip()
-    else:
-        default_title, default_sub = "My Place", ""
-    title = st.text_input("Title", default_title)
-    subtitle = st.text_input("Subtitle", default_sub)
+# ---------------- Layers ----------------
+sb.subheader("Layers")
+network = sb.selectbox("Streets", ["drive", "all", "walk", "bike"],
+                       help="'all' and 'walk' add alleys/paths = denser map")
+layers = {
+    "water": sb.checkbox("Water", True),
+    "parks": sb.checkbox("Parks", False),
+    "buildings": sb.checkbox("Buildings", False, help="Slow for big radius"),
+    "rail": sb.checkbox("Railways", False),
+}
+labels = sb.checkbox("Street names", False)
+label_size = sb.slider("Street name size (pt)", 2.0, 10.0, 3.0, 0.5,
+                       help="Small posters (A4) need bigger names, e.g. 5-6 pt")
+road_scale = sb.slider("Road thickness", 0.3, 3.0, 1.0, 0.1)
 
-    st.subheader("Layers")
-    network = st.selectbox("Streets", ["drive", "all", "walk", "bike"],
-                           help="'all' and 'walk' add alleys/paths = denser map")
-    layers = {
-        "water": st.checkbox("Water", True),
-        "parks": st.checkbox("Parks", False),
-        "buildings": st.checkbox("Buildings", False, help="Slow for big radius"),
-        "rail": st.checkbox("Railways", False),
-    }
-    labels = st.checkbox("Street names", False)
-    label_size = st.slider("Street name size (pt)", 2.0, 10.0, 3.0, 0.5,
-                           help="Small posters (A4) need bigger names, e.g. 5-6 pt")
-    road_scale = st.slider("Road thickness", 0.3, 3.0, 1.0, 0.1)
-
-    st.subheader("Colors")
-    p = PRESETS[preset]
+# ---------------- Colors ----------------
+sb.subheader("Colors")
+preset = sb.selectbox("Color preset", list(PRESETS))
+with sb.expander("Fine-tune colors"):
     # key includes preset name -> switching preset resets the pickers
-    # one picker per color the preset defines (Google Maps has extra ones)
     colors = {k: st.color_picker(k.replace("_", " ").capitalize(), v, key=f"{preset}_{k}")
-              for k, v in p.items()}
+              for k, v in PRESETS[preset].items()}
 
-    submitted = st.form_submit_button("Generate map", type="primary")
+generate = sb.button("Generate poster", type="primary", use_container_width=True)
 
-if submitted:
+# ---------------- 1. Interactive area picker ----------------
+st.subheader("1. Pick the area")
+st.caption("Click anywhere to move the center. The red outline is exactly what the poster will show.")
+
+ratio = (0.88 * size[0]) / (0.76 * size[1])          # poster map box width/height
+m_per_deg_lat = 111_320
+m_per_deg_lon = 111_320 * math.cos(math.radians(lat))
+
+m = folium.Map(location=[lat, lon], tiles="OpenStreetMap", control_scale=True)
+if shape == "Circle":
+    folium.Circle([lat, lon], radius=radius, color="#e63946", weight=3,
+                  fill=True, fill_opacity=0.08).add_to(m)
+    half_w = half_h = radius
+else:
+    half_h, half_w = radius, radius * ratio
+    folium.Rectangle(
+        [[lat - half_h / m_per_deg_lat, lon - half_w / m_per_deg_lon],
+         [lat + half_h / m_per_deg_lat, lon + half_w / m_per_deg_lon]],
+        color="#e63946", weight=3, fill=True, fill_opacity=0.08).add_to(m)
+folium.Marker([lat, lon], tooltip="Poster center").add_to(m)
+pad = 1.3                                            # show a little around the outline
+m.fit_bounds([[lat - pad * half_h / m_per_deg_lat, lon - pad * half_w / m_per_deg_lon],
+              [lat + pad * half_h / m_per_deg_lat, lon + pad * half_w / m_per_deg_lon]])
+
+# returned_objects limits re-runs to clicks only (panning/zooming won't re-run)
+out = st_folium(m, height=460, use_container_width=True,
+                returned_objects=["last_clicked"], key="picker")
+click = (out or {}).get("last_clicked")
+if click and click != ss.get("last_click"):          # a NEW click -> move center
+    ss["last_click"] = click
+    ss["center"] = (click["lat"], click["lng"])
+    st.rerun()
+
+# ---------------- 2. Poster ----------------
+st.subheader("2. Poster")
+if generate:
     opts = dict(lat=lat, lon=lon, radius=radius, shape=shape, size=size,
                 title=title, subtitle=subtitle, network=network, layers=layers,
                 labels=labels, label_size=label_size, road_scale=road_scale, colors=colors)
     with st.spinner("Downloading OpenStreetMap data (first time per area) and drawing..."):
         try:
             fig = render(opts)
-            st.session_state["png"] = fig_bytes(fig, "png", dpi=80)
-            st.session_state["pdf"] = fig_bytes(fig, "pdf")
-            st.session_state["name"] = title.lower().replace(" ", "_") or "map"
+            ss["png"] = fig_bytes(fig, "png", dpi=80)
+            ss["pdf"] = fig_bytes(fig, "pdf")
+            ss["name"] = title.lower().replace(" ", "_") or "map"
             plt.close(fig)
         except Exception as e:
             st.error(f"Couldn't build the map: {e}")
 
-if "png" in st.session_state:
+if "png" in ss:
     left, right = st.columns([3, 1])
-    left.image(st.session_state["png"], use_container_width=True)
-    right.download_button("Download PDF (print-ready)", st.session_state["pdf"],
-                          file_name=f"{st.session_state['name']}_poster.pdf",
+    left.image(ss["png"], use_container_width=True)
+    right.download_button("Download PDF (print-ready)", ss["pdf"],
+                          file_name=f"{ss['name']}_poster.pdf",
                           mime="application/pdf", type="primary")
     right.caption("The PDF is vector: sharp at any print size. "
                   "Preview is low-res on purpose so it loads fast.")
 else:
-    st.info("Pick your options on the left and click **Generate map**.")
+    st.info("Pick the area above, then click **Generate poster** in the sidebar.")

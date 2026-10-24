@@ -1,3 +1,5 @@
 streamlit
 osmnx
 matplotlib
+folium
+streamlit-folium
